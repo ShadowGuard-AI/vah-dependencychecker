@@ -63,6 +63,10 @@ def update_nvd_data(data_dir: str) -> None:
     Args:
         data_dir (str): The directory to store the NVD data feeds.
     """
+    # datetime is not imported at the top of this file. It is imported
+    # inside the __main__ guard at the bottom, just before main() runs,
+    # so this line works in a direct run and raises NameError if the
+    # module is ever imported and called as a library.
     current_year = datetime.datetime.now().year
     for year in range(current_year - 5, current_year + 1):
         try:
@@ -120,6 +124,10 @@ def load_nvd_data(data_dir: str) -> Dict[str, Dict]:
             filepath = os.path.join(data_dir, filename)
             try:
                  #gunzip the file before parsing since lxml doesn't handle it directly
+                 # The whole decompressed year is read into memory and
+                 # parsed as one tree. These feeds run to hundreds of
+                 # megabytes per year, so the loader's memory cost is
+                 # the full archive, several times over across the set.
                  import gzip
                  with gzip.open(filepath, 'rb') as f:
                      xml_content = f.read()
@@ -166,6 +174,13 @@ def check_dependencies_for_vulnerabilities(dependencies: List[Tuple[str, str]], 
             if "affected_products" in vulnerability_data:
 
                 for product in vulnerability_data["affected_products"]:
+                    # Two shortcuts meet here. The match is a raw
+                    # substring test against the whole CPE string, so a
+                    # name appearing inside another vendor or product
+                    # string counts. And the version specifier parsed
+                    # from the requirements file is never compared at
+                    # all: a CVE affecting only an old release flags a
+                    # project pinned to the fixed one, in the same words.
                     if package_name.lower() in product.lower():
                             vulnerable_dependencies.append({
                                 "package": package_name,
