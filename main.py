@@ -1,12 +1,17 @@
 import argparse
+import datetime
 import logging
 import os
 import sys
 import requests
 import lxml.etree as ET
-from packaging import version
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version, InvalidVersion
 from packaging.requirements import Requirement
 from typing import List, Dict, Tuple
+
+MAX_DECOMPRESSED_BYTES = 100 * 1024 * 1024
+DOWNLOAD_TIMEOUT = 30
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -43,7 +48,7 @@ def download_nvd_feed(year: int, data_dir: str) -> None:
     filename = os.path.join(data_dir, f"nvdcve-1.1-{year}.xml.gz")
     logging.info(f"Downloading NVD data feed for {year} from {url} to {filename}")
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
         os.makedirs(data_dir, exist_ok=True)
@@ -56,23 +61,19 @@ def download_nvd_feed(year: int, data_dir: str) -> None:
         raise
 
 
-def update_nvd_data(data_dir: str) -> None:
-    """
-    Updates the NVD data feeds for the last 5 years.
-
-    Args:
-        data_dir (str): The directory to store the NVD data feeds.
-    """
-    # datetime is not imported at the top of this file. It is imported
-    # inside the __main__ guard at the bottom, just before main() runs,
-    # so this line works in a direct run and raises NameError if the
-    # module is ever imported and called as a library.
+def update_nvd_data(data_dir: str):
+    """Update feeds for the last 6 years. Returns (attempted, failed, failed_years)."""
     current_year = datetime.datetime.now().year
+    attempted = 0
+    failed_years = []
     for year in range(current_year - 5, current_year + 1):
+        attempted += 1
         try:
             download_nvd_feed(year, data_dir)
         except Exception as e:
+            failed_years.append(year)
             logging.error(f"Failed to download data for year {year}: {e}")
+    return attempted, len(failed_years), failed_years
 
 
 def parse_requirements_file(requirements_file: str) -> List[Tuple[str, str]]:
@@ -108,6 +109,36 @@ def parse_requirements_file(requirements_file: str) -> List[Tuple[str, str]]:
     return dependencies
 
 
+def _safe_parser():
+    return ET.XMLParser(resolve_entities=False, no_network=True, load_dtd=False)
+
+
+def parse_cpe(product_str):
+    """Parse a CPE string into (vendor, product, version) or None."""
+    if not product_str:
+        return None
+    text = product_str.strip()
+    if text.startswith("cpe:2.3:"):
+        parts = text.split(":")
+        if len(parts) >= 7:
+            return parts[3].lower(), parts[4].lower(), parts[5]
+        return None
+    if text.startswith("cpe:/"):
+        parts = text[5:].split(":")
+        if len(parts) >= 4:
+            return parts[1].lower(), parts[2].lower(), parts[3]
+        if len(parts) == 3:
+            return parts[1].lower(), parts[2].lower(), ""
+        return None
+    return None, text.lower(), ""
+
+
+def load_nvd_data_with_stats(data_dir: str):
+    vulnerabilities = load_nvd_data(data_dir)
+    stats = getattr(load_nvd_data, "_last_stats", {"feeds_loaded": 0, "entries_loaded": len(vulnerabilities)})
+    return vulnerabilities, stats
+
+
 def load_nvd_data(data_dir: str) -> Dict[str, Dict]:
     """
     Loads NVD data from XML files in the specified directory.
@@ -119,20 +150,20 @@ def load_nvd_data(data_dir: str) -> Dict[str, Dict]:
         Dict[str, Dict]: A dictionary mapping CVE IDs to vulnerability information.
     """
     vulnerabilities = {}
+    feeds_loaded = 0
+    load_nvd_data._last_stats = {"feeds_loaded": 0, "entries_loaded": 0}
     for filename in os.listdir(data_dir):
         if filename.endswith(".xml.gz"):
             filepath = os.path.join(data_dir, filename)
             try:
-                 #gunzip the file before parsing since lxml doesn't handle it directly
-                 # The whole decompressed year is read into memory and
-                 # parsed as one tree. These feeds run to hundreds of
-                 # megabytes per year, so the loader's memory cost is
-                 # the full archive, several times over across the set.
                  import gzip
                  with gzip.open(filepath, 'rb') as f:
-                     xml_content = f.read()
-
-                 tree = ET.fromstring(xml_content) #parse from string since we ungzipped it.
+                     xml_content = f.read(MAX_DECOMPRESSED_BYTES + 1)
+                 if len(xml_content) > MAX_DECOMPRESSED_BYTES:
+                     logging.error(f"Feed {filepath} exceeds the decompressed size cap of {MAX_DECOMPRESSED_BYTES} bytes; skipped")
+                     continue
+                 tree = ET.fromstring(xml_content, parser=_safe_parser())
+                 feeds_loaded += 1
                  for entry in tree.findall(".//{http://nvd.nist.gov/feeds/xml/cve/1.1}entry"):
                      cve_id = entry.find(".//{http://nvd.nist.gov/feeds/xml/cve/1.1}cve-id").text
                      vulnerabilities[cve_id] = {}
@@ -154,6 +185,7 @@ def load_nvd_data(data_dir: str) -> Dict[str, Dict]:
                  logging.error(f"Error decompressing gzip file {filepath}: {e}")
             except Exception as e:
                 logging.error(f"Error loading NVD data from {filepath}: {e}")
+    load_nvd_data._last_stats = {"feeds_loaded": feeds_loaded, "entries_loaded": len(vulnerabilities)}
     return vulnerabilities
 
 
@@ -169,37 +201,61 @@ def check_dependencies_for_vulnerabilities(dependencies: List[Tuple[str, str]], 
         List[Dict]: A list of dictionaries, each containing vulnerability information for a dependency.
     """
     vulnerable_dependencies = []
+    seen = set()
     for package_name, package_version_specifier in dependencies:
+        spec_set = None
+        exact_versions = []
+        try:
+            spec_set = SpecifierSet(package_version_specifier or "")
+            for spec in spec_set:
+                if spec.operator in ("==", "==="):
+                    exact_versions.append(spec.version.rstrip(".*"))
+        except Exception:
+            spec_set = None
         for cve_id, vulnerability_data in vulnerabilities.items():
-            if "affected_products" in vulnerability_data:
-
-                for product in vulnerability_data["affected_products"]:
-                    # Two shortcuts meet here. The match is a raw
-                    # substring test against the whole CPE string, so a
-                    # name appearing inside another vendor or product
-                    # string counts. And the version specifier parsed
-                    # from the requirements file is never compared at
-                    # all: a CVE affecting only an old release flags a
-                    # project pinned to the fixed one, in the same words.
-                    if package_name.lower() in product.lower():
-                            vulnerable_dependencies.append({
-                                "package": package_name,
-                                "version_specifier": package_version_specifier,
-                                "cve_id": cve_id,
-                                "severity": vulnerability_data["severity"],
-                                "affected_product": product
-                            })
-
+            if "affected_products" not in vulnerability_data:
+                continue
+            for product in vulnerability_data["affected_products"]:
+                parsed = parse_cpe(product)
+                if not parsed:
+                    continue
+                _vendor, cpe_product, cpe_version = parsed
+                if not cpe_product or cpe_product != package_name.lower().replace("-", "_"):
+                    if not cpe_product or cpe_product != package_name.lower():
+                        continue
+                matched = False
+                if cpe_version in ("", "*", "-"):
+                    matched = True
+                else:
+                    try:
+                        entry_v = Version(cpe_version)
+                    except InvalidVersion:
+                        continue
+                    if exact_versions:
+                        matched = any(str(entry_v) == str(Version(v)) for v in exact_versions if v)
+                    elif spec_set is not None and len(spec_set) > 0:
+                        matched = spec_set.contains(entry_v, prereleases=True)
+                    else:
+                        matched = False
+                if matched:
+                    key = (package_name, cve_id, product)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    vulnerable_dependencies.append({
+                        "package": package_name,
+                        "version_specifier": package_version_specifier,
+                        "cve_id": cve_id,
+                        "severity": vulnerability_data["severity"],
+                        "affected_product": product
+                    })
     return vulnerable_dependencies
 
 
-def generate_report(vulnerable_dependencies: List[Dict]) -> None:
-    """
-    Generates a report of vulnerable dependencies.
-
-    Args:
-        vulnerable_dependencies (List[Dict]): A list of dictionaries, each containing vulnerability information.
-    """
+def generate_report(vulnerable_dependencies: List[Dict], stats=None) -> None:
+    counts = ""
+    if stats:
+        counts = f" (feeds loaded: {stats.get('feeds_loaded', 0)}, CVE entries loaded: {stats.get('entries_loaded', 0)}, downloads failed: {stats.get('downloads_failed', 0)})"
     if vulnerable_dependencies:
         print("Vulnerable Dependencies Found:")
         for vulnerability in vulnerable_dependencies:
@@ -210,7 +266,7 @@ def generate_report(vulnerable_dependencies: List[Dict]) -> None:
             print(f"  Affected Product: {vulnerability['affected_product']}")
             print("-" * 30)
     else:
-        print("No known vulnerabilities found in the specified dependencies.")
+        print(f"No known vulnerabilities found in the specified dependencies.{counts}")
 
 
 def main() -> None:
@@ -228,19 +284,29 @@ def main() -> None:
         logging.error(f"Requirements file not found: {args.requirements_file}")
         sys.exit(1)
 
-    # Update NVD data if requested
+    downloads_failed = 0
+    attempted = 0
+    failed_years = []
     if args.update_nvd:
         try:
-            update_nvd_data(args.nvd_data_dir)
+            attempted, downloads_failed, failed_years = update_nvd_data(args.nvd_data_dir)
         except Exception as e:
             logging.error(f"Failed to update NVD data: {e}")
             sys.exit(1)
+        if attempted and downloads_failed == attempted:
+            logging.error(f"All {attempted} NVD feed downloads failed (years: {failed_years}); no data was loaded, so no clean verdict is possible.")
+            sys.exit(1)
+        if downloads_failed:
+            logging.warning(f"Partial update: {downloads_failed} of {attempted} feed downloads failed (years: {failed_years}); report rests only on the feeds that loaded.")
 
-    # Load NVD data
     try:
-        vulnerabilities = load_nvd_data(args.nvd_data_dir)
+        vulnerabilities, load_stats = load_nvd_data_with_stats(args.nvd_data_dir)
     except Exception as e:
         logging.error(f"Failed to load NVD data: {e}")
+        sys.exit(1)
+    stats = {"feeds_loaded": load_stats.get("feeds_loaded", 0), "entries_loaded": load_stats.get("entries_loaded", len(vulnerabilities)), "downloads_failed": downloads_failed}
+    if len(vulnerabilities) == 0:
+        logging.error(f"No CVE entries were loaded (feeds loaded: {stats['feeds_loaded']}, downloads failed: {downloads_failed}); refusing to print a clean verdict.")
         sys.exit(1)
 
 
@@ -256,12 +322,10 @@ def main() -> None:
     # Check dependencies for vulnerabilities
     vulnerable_dependencies = check_dependencies_for_vulnerabilities(dependencies, vulnerabilities)
 
-    # Generate report
-    generate_report(vulnerable_dependencies)
+    generate_report(vulnerable_dependencies, stats)
 
 
 if __name__ == "__main__":
-    import datetime
     main()
 
 
