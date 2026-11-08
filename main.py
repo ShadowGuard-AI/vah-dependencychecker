@@ -167,9 +167,13 @@ def load_nvd_data(data_dir: str) -> Dict[str, Dict]:
                  for entry in tree.findall(".//{http://nvd.nist.gov/feeds/xml/cve/1.1}entry"):
                      cve_id = entry.find(".//{http://nvd.nist.gov/feeds/xml/cve/1.1}cve-id").text
                      vulnerabilities[cve_id] = {}
-                     cvss_v2 = entry.find(".//{http://nvd.nist.gov/feeds/xml/cve/1.1}cvss/baseMetricV2/severity")
-                     if cvss_v2 is not None:
-                        vulnerabilities[cve_id]["severity"] = cvss_v2.text
+                     # Severity lives under baseMetricV2, whose child
+                     # elements sit in the separate CVSS v2 namespace in
+                     # real NVD 1.1 feeds, so match by local name instead
+                     # of a namespace qualified path.
+                     severity_nodes = entry.xpath(".//*[local-name()='baseMetricV2']/*[local-name()='severity']")
+                     if severity_nodes and severity_nodes[0].text:
+                        vulnerabilities[cve_id]["severity"] = severity_nodes[0].text
                      else:
                          vulnerabilities[cve_id]["severity"] = "N/A"
 
@@ -204,12 +208,8 @@ def check_dependencies_for_vulnerabilities(dependencies: List[Tuple[str, str]], 
     seen = set()
     for package_name, package_version_specifier in dependencies:
         spec_set = None
-        exact_versions = []
         try:
             spec_set = SpecifierSet(package_version_specifier or "")
-            for spec in spec_set:
-                if spec.operator in ("==", "==="):
-                    exact_versions.append(spec.version.rstrip(".*"))
         except Exception:
             spec_set = None
         for cve_id, vulnerability_data in vulnerabilities.items():
@@ -231,9 +231,11 @@ def check_dependencies_for_vulnerabilities(dependencies: List[Tuple[str, str]], 
                         entry_v = Version(cpe_version)
                     except InvalidVersion:
                         continue
-                    if exact_versions:
-                        matched = any(str(entry_v) == str(Version(v)) for v in exact_versions if v)
-                    elif spec_set is not None and len(spec_set) > 0:
+                    if spec_set is not None and len(spec_set) > 0:
+                        # SpecifierSet.contains compares real Version
+                        # objects, so ==2.0 matches CPE version 2.0.0 and
+                        # ==2.31.* matches 2.31.0. Comparing version
+                        # strings instead missed both of those.
                         matched = spec_set.contains(entry_v, prereleases=True)
                     else:
                         matched = False
